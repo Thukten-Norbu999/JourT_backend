@@ -26,6 +26,9 @@ func SetupRoutes(r *gin.Engine, db *gorm.DB) {
 	api := r.Group("/api")
 	api.Use(middleware.RequireAuth())
 
+	dashboardH := handlers.NewDashboardHandler(db)
+	api.GET("/dashboard", dashboardH.GetDashboard)
+
 	setupH := handlers.NewSetupHandler(db)
 	api.GET("/setups", setupH.List)
 	api.POST("/setups", setupH.Create)

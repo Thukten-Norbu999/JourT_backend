@@ -1,13 +1,10 @@
+// api/handlers/import_handler.go
 package handlers
 
 import (
-	"encoding/csv"
-	"encoding/json"
-	"io"
 	"net/http"
-	"path/filepath"
-	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -15,6 +12,32 @@ import (
 	"jourt_backend/internal/models"
 	"jourt_backend/pkg/middleware"
 )
+
+/*
+Frontend sends JSON like:
+
+POST /api/import/csv
+{
+  "sourceFile": "my.csv",
+  "mapping": {...},
+  "options": { "filledOnly": true, "singlePriceMode": true, "preferClosingTime": true },
+  "trades": [
+    {
+      "date": "2025-12-31T01:23:45.000Z",
+      "symbol": "EURUSD",
+      "side": "BUY",
+      "qty": 1,
+      "entry": 1.1,
+      "exit": 1.2,
+      "fees": 0.1,
+      "pnl": 10,
+      "meta": { ... }
+    }
+  ],
+  "account": "Paper",
+  "session": "NY"
+}
+*/
 
 type ImportHandler struct {
 	db *gorm.DB
@@ -24,116 +47,74 @@ func NewImportHandler(db *gorm.DB) *ImportHandler {
 	return &ImportHandler{db: db}
 }
 
-// POST /import/csv (multipart/form-data)
-// fields: file (required), mapping (optional JSON), account(optional), session(optional)
+type ImportOptions struct {
+	FilledOnly        bool `json:"filledOnly"`
+	SinglePriceMode   bool `json:"singlePriceMode"`
+	PreferClosingTime bool `json:"preferClosingTime"`
+}
+
+type ImportTrade struct {
+	Date   string  `json:"date"`
+	Symbol string  `json:"symbol"`
+	Side   string  `json:"side"`
+	Qty    float64 `json:"qty"`
+
+	Entry float64 `json:"entry"`
+	Exit  float64 `json:"exit"`
+	Fees  float64 `json:"fees"`
+	PnL   float64 `json:"pnl"`
+
+	Meta map[string]any `json:"meta"`
+}
+
+type ImportRequest struct {
+	SourceFile string            `json:"sourceFile"`
+	Mapping    map[string]string `json:"mapping"`
+	Options    ImportOptions     `json:"options"`
+	Trades     []ImportTrade     `json:"trades"`
+
+	Account string `json:"account"`
+	Session string `json:"session"`
+}
+
+// POST /api/import/csv (JSON)
 func (h *ImportHandler) ImportCSV(c *gin.Context) {
 	userID := middleware.GetUserID(c)
 
-	fh, err := c.FormFile("file")
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "file is required"})
+	var req ImportRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "invalid request json",
+			"details": err.Error(),
+		})
 		return
 	}
 
-	ext := strings.ToLower(filepath.Ext(fh.Filename))
-	if ext != ".csv" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "only .csv is supported for now"})
+	if len(req.Trades) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no trades provided"})
 		return
 	}
 
-	file, err := fh.Open()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to open uploaded file"})
-		return
-	}
-	defer file.Close()
-
-	// Optional: account/session override for imported trades
-	account := strings.TrimSpace(c.PostForm("account"))
+	account := strings.TrimSpace(req.Account)
 	if account == "" {
 		account = "Paper"
 	}
-	session := strings.TrimSpace(c.PostForm("session"))
+	session := strings.TrimSpace(req.Session)
 
-	// Optional mapping JSON (from your frontend mapping UI)
-	mapping := map[string]string{}
-	if m := strings.TrimSpace(c.PostForm("mapping")); m != "" {
-		if err := json.Unmarshal([]byte(m), &mapping); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid mapping json"})
-			return
-		}
-	}
+	trades := make([]models.Trade, 0, len(req.Trades))
+	rowErrors := make([]gin.H, 0, 8)
 
-	reader := csv.NewReader(file)
-	reader.TrimLeadingSpace = true
-
-	// Read header row
-	headers, err := reader.Read()
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "csv is empty or invalid"})
-		return
-	}
-
-	// Build header index map
-	headerIndex := map[string]int{}
-	for i, h := range headers {
-		headerIndex[strings.TrimSpace(h)] = i
-	}
-
-	// If mapping not provided, auto-map from headers (best-effort)
-	if len(mapping) == 0 {
-		mapping = autoMapHeaders(headers)
-	}
-
-	// Validate required mapping keys exist
-	required := []string{"date", "symbol", "side", "qty", "entry", "exit", "fees", "pnl"}
-	for _, k := range required {
-		if strings.TrimSpace(mapping[k]) == "" {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error":   "mapping incomplete",
-				"missing": k,
-				"hint":    "provide mapping JSON from frontend or rename CSV headers",
-			})
-			return
-		}
-		// make sure header exists in file
-		if _, ok := headerIndex[mapping[k]]; !ok {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error":  "mapped header not found in csv",
-				"field":  k,
-				"header": mapping[k],
-			})
-			return
-		}
-	}
-
-	// Parse rows -> trades
-	var trades []models.Trade
-	var rowErrors []gin.H
-
-	rowNum := 1 // header is row 1
-	for {
-		rowNum++
-		row, err := reader.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			addRowErr(&rowErrors, rowNum, "csv read error: "+err.Error())
-			continue
-		}
-
-		tr, ok, msg := normalizeCSVRow(userID, row, headerIndex, mapping, account, session)
+	for i, t := range req.Trades {
+		tr, ok, msg := normalizeImportTrade(userID, t, account, session)
 		if !ok {
-			addRowErr(&rowErrors, rowNum, msg)
+			addRowErrIndex(&rowErrors, i, msg)
 			continue
 		}
-
 		trades = append(trades, tr)
 
-		// safety cap (optional): prevent someone uploading 2 million rows by accident
+		// safety cap
 		if len(trades) > 200000 {
-			addRowErr(&rowErrors, rowNum, "too many rows (cap reached)")
+			addRowErrIndex(&rowErrors, i, "too many rows (cap reached)")
 			break
 		}
 	}
@@ -146,144 +127,102 @@ func (h *ImportHandler) ImportCSV(c *gin.Context) {
 		return
 	}
 
-	// Save to DB in a transaction
 	var inserted int
-	err = h.db.Transaction(func(tx *gorm.DB) error {
-		// Create import job
+	err := h.db.Transaction(func(tx *gorm.DB) error {
+		src := strings.TrimSpace(req.SourceFile)
+		if src == "" {
+			src = "import.json"
+		}
+
 		job := models.ImportJob{
 			UserID:     userID,
-			SourceFile: fh.Filename,
-			Broker:     "", // optional later
+			SourceFile: src,
+			Broker:     "",
 			RowsCount:  len(trades),
 		}
 		if err := tx.Create(&job).Error; err != nil {
 			return err
 		}
 
-		// Bulk insert trades
-		// (CreateInBatches avoids timeouts for large files)
 		if err := tx.CreateInBatches(&trades, 500).Error; err != nil {
 			return err
 		}
-		inserted = len(trades)
 
+		inserted = len(trades)
 		return nil
 	})
 
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to import trades", "details": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "failed to import trades",
+			"details": err.Error(),
+		})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"ok":       true,
 		"inserted": inserted,
-		"errors":   rowErrors, // only first few
-		"mapping":  mapping,
+		"errors":   rowErrors,   // capped
+		"mapping":  req.Mapping, // echo for debugging
+		"options":  req.Options, // echo for debugging
+		"source":   req.SourceFile,
 	})
 }
 
-func addRowErr(list *[]gin.H, row int, msg string) {
-	// limit returned errors (avoid huge responses)
+func addRowErrIndex(list *[]gin.H, idx int, msg string) {
 	if len(*list) >= 25 {
 		return
 	}
-	*list = append(*list, gin.H{"row": row, "error": msg})
+	*list = append(*list, gin.H{
+		"index": idx + 1, // 1-based
+		"error": msg,
+	})
 }
 
-func autoMapHeaders(headers []string) map[string]string {
-	lower := make([]string, len(headers))
-	for i, h := range headers {
-		lower[i] = strings.ToLower(strings.TrimSpace(h))
-	}
-
-	pick := func(keys ...string) string {
-		for i, h := range lower {
-			for _, k := range keys {
-				if strings.Contains(h, k) {
-					return strings.TrimSpace(headers[i])
-				}
-			}
-		}
-		return ""
-	}
-
-	return map[string]string{
-		"date":   pick("time", "date", "filled", "executed"),
-		"symbol": pick("symbol", "instrument", "ticker", "product"),
-		"side":   pick("side", "buy/sell", "direction", "type"),
-		"qty":    pick("qty", "quantity", "size", "volume", "units"),
-		"entry":  pick("entry", "avg entry", "open price", "entry price", "price"),
-		"exit":   pick("exit", "avg exit", "close price", "exit price"),
-		"fees":   pick("fee", "fees", "commission", "swap"),
-		"pnl":    pick("pnl", "profit", "pl", "net pnl"),
-	}
-}
-
-func normalizeCSVRow(
-	userID uint,
-	row []string,
-	headerIndex map[string]int,
-	mapping map[string]string,
-	account string,
-	session string,
-) (models.Trade, bool, string) {
-
-	get := func(field string) string {
-		h := mapping[field]
-		i := headerIndex[h]
-		if i < 0 || i >= len(row) {
-			return ""
-		}
-		return strings.TrimSpace(row[i])
-	}
-
-	// Parse date (supports a few common formats)
-	dateStr := get("date")
-	tm, ok := parseTimeFlexible(dateStr)
+func normalizeImportTrade(userID uint, in ImportTrade, account, session string) (models.Trade, bool, string) {
+	dateStr := strings.TrimSpace(in.Date)
+	tm, ok := parseTimeFlexibleImport(dateStr)
 	if !ok {
 		return models.Trade{}, false, "invalid date/time: " + dateStr
 	}
 
-	side := strings.ToUpper(get("side"))
-	if side == "LONG" {
+	side := strings.ToUpper(strings.TrimSpace(in.Side))
+	switch side {
+	case "LONG":
 		side = "BUY"
-	}
-	if side == "SHORT" {
+	case "SHORT":
 		side = "SELL"
 	}
 	if side != "BUY" && side != "SELL" {
-		// still accept common values
 		if strings.Contains(side, "BUY") {
 			side = "BUY"
 		} else if strings.Contains(side, "SELL") {
 			side = "SELL"
 		} else {
-			return models.Trade{}, false, "invalid side: " + side
+			return models.Trade{}, false, "invalid side: " + strings.TrimSpace(in.Side)
 		}
 	}
 
-	symbol := get("symbol")
+	symbol := strings.TrimSpace(in.Symbol)
 	if symbol == "" {
 		return models.Trade{}, false, "missing symbol"
 	}
 
-	qty := parseNum(get("qty"))
-	entry := parseNum(get("entry"))
-	exit := parseNum(get("exit"))
-	fees := parseNum(get("fees"))
-	pnl := parseNum(get("pnl"))
+	if in.Qty <= 0 {
+		return models.Trade{}, false, "qty must be > 0"
+	}
 
 	tr := models.Trade{
 		UserID:  userID,
 		Date:    tm,
 		Symbol:  symbol,
 		Side:    side,
-		Qty:     qty,
-		Entry:   entry,
-		Exit:    exit,
-		Fees:    fees,
-		PnL:     pnl,
+		Qty:     in.Qty,
+		Entry:   in.Entry,
+		Exit:    in.Exit,
+		Fees:    in.Fees,
+		PnL:     in.PnL,
 		Account: account,
 		Session: session,
 	}
@@ -291,24 +230,50 @@ func normalizeCSVRow(
 	return tr, true, ""
 }
 
-func parseNum(v string) float64 {
-	// remove currency, commas, etc.
-	clean := strings.ReplaceAll(v, ",", "")
-	clean = strings.TrimSpace(clean)
-	clean = strings.Map(func(r rune) rune {
-		if (r >= '0' && r <= '9') || r == '.' || r == '-' {
-			return r
+// self-contained (won't conflict with any existing parseTimeFlexible you may have elsewhere)
+func parseTimeFlexibleImport(s string) (time.Time, bool) {
+	str := strings.TrimSpace(s)
+	if str == "" {
+		return time.Time{}, false
+	}
+
+	// Most common from frontend: ISO with Z
+	if t, err := time.Parse(time.RFC3339Nano, str); err == nil {
+		return t, true
+	}
+	if t, err := time.Parse(time.RFC3339, str); err == nil {
+		return t, true
+	}
+
+	// Common "no timezone" formats (assume local)
+	layouts := []string{
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04",
+		"2006-01-02",
+		"02/01/2006 15:04:05", // DD/MM/YYYY
+		"02/01/2006 15:04",
+		"02/01/2006",
+		"01/02/2006 15:04:05", // MM/DD/YYYY
+		"01/02/2006 15:04",
+		"01/02/2006",
+		"Jan 2, 2006 15:04:05",
+		"Jan 2, 2006 15:04",
+		"Jan 2, 2006",
+	}
+
+	for _, layout := range layouts {
+		if t, err := time.ParseInLocation(layout, str,
+			time.Local); err == nil {
+			return t, true
 		}
-		return -1
-	}, clean)
-
-	if clean == "" || clean == "-" {
-		return 0
 	}
 
-	f, err := strconv.ParseFloat(clean, 64)
-	if err != nil {
-		return 0
+	// last attempt: Date.parse-like inputs that sometimes still parse
+	if t, err := time.ParseInLocation(time.ANSIC, str, time.Local); err == nil {
+		return t, true
 	}
-	return f
+
+	return time.Time{}, false
 }
