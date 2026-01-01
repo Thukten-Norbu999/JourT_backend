@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: jourt-backend
+    env: go
+    buildCommand: go build -o jourt_backend
+    startCommand: ./jourt_backend
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: jourt-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: GIN_MODE
+        value: release
+      - key: PORT
+        value: 8080
+
+databases:
+  - name: jourt-db
+    databaseName: jourt
+    user: admin

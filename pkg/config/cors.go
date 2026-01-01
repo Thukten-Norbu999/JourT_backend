@@ -10,7 +10,7 @@ import (
 // SetupCORS configures CORS for the API
 func SetupCORS() gin.HandlerFunc {
 	return cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:3000", "http://127.0.0.1:5500"}, // Change as needed
+		AllowOrigins:     []string{"http://localhost:3000", "http://127.0.0.1:5500", "https://jourt.onrender.com"}, // Change as needed
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Content-Type", "Authorization", "Role"},
 		AllowCredentials: true,
