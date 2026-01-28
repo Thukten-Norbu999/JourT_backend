@@ -2,7 +2,6 @@ package auth
 
 import (
 	"net/http"
-	"os"
 
 	"github.com/gin-gonic/gin"
 )
@@ -10,16 +9,14 @@ import (
 const CookieName = "jourt_auth"
 
 func SetAuthCookie(c *gin.Context, token string) {
-	secure := os.Getenv("GIN_MODE") == "release" // true in prod (https), false in dev
-
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     CookieName,
 		Value:    token,
 		Path:     "/",
-		HttpOnly: true,                 // ✅ JS cannot read it
-		Secure:   secure,               // ✅ true only on HTTPS
-		SameSite: http.SameSiteLaxMode, // ✅ works across localhost ports
-		MaxAge:   60 * 60 * 24 * 7,     // 7 days
+		HttpOnly: true,
+		Secure:   true,                  // ✅ MUST be true for SameSite=None
+		SameSite: http.SameSiteNoneMode, // ✅ CHANGED from Lax to None
+		MaxAge:   60 * 60 * 24 * 7,      // 7 days
 	})
 }
 
@@ -29,8 +26,8 @@ func ClearAuthCookie(c *gin.Context) {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   os.Getenv("GIN_MODE") == "release",
-		SameSite: http.SameSiteLaxMode,
+		Secure:   true,                  // ✅ MUST be true
+		SameSite: http.SameSiteNoneMode, // ✅ CHANGED from Lax to None
 		MaxAge:   -1,
 	})
 }
